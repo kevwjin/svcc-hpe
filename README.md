@@ -10,37 +10,55 @@ Repository for the HPE BiBiFi contest submission.
 ## Build
 
 The contest builds from the root-level `build/` directory. The required target is
-32-bit Linux, so native builds may fail on macOS, especially on Apple Silicon.
+32-bit Linux on Ubuntu 18.04, so use the provided Docker sandbox even on a newer
+Ubuntu server.
 
-In the contest-style environment, `make` should run from `build/`:
+Clone or update the repo first:
 
 ```sh
-cd build
+git clone git@github.com:kevwjin/svcc-hpe.git
+cd svcc-hpe
+```
+
+If the repo already exists:
+
+```sh
+git pull --ff-only
+```
+
+Build the sandbox image:
+
+```sh
+docker build --platform linux/amd64 -t bibifi-sandbox -f Dockerfile.sandbox .
+```
+
+Run `make` inside the sandbox with `build/` mounted at `/connect`:
+
+```sh
+docker run --platform linux/amd64 --rm -it \
+  -v "$PWD/build:/connect" \
+  bibifi-sandbox
+```
+
+Inside the container:
+
+```sh
 make
 ```
 
-If native `make` fails locally, use an amd64 Ubuntu 18.04 container:
+For a one-shot noninteractive build:
 
 ```sh
 docker run --platform linux/amd64 --rm \
   -v "$PWD/build:/connect" \
-  ubuntu:18.04 \
-  bash -lc 'apt-get update >/dev/null &&
-    dpkg --add-architecture i386 &&
-    apt-get update >/dev/null &&
-    DEBIAN_FRONTEND=noninteractive apt-get install -y build-essential gcc-multilib libssl-dev:i386 >/dev/null &&
-    cd /connect &&
-    gcc -O0 -g -m32 -fno-stack-protector -o stor stor.c malloc-2.7.2.c -lssl -lcrypto &&
-    test -x stor'
+  bibifi-sandbox \
+  -lc 'make clean >/dev/null 2>&1 || true; make'
 ```
-
-That verifies the same compile command used by `build/Makefile`. It does not run
-the `execstack` post-step, but the contest environment runs `make`, which includes
-that step.
 
 ## Manual Smoke Tests
 
-After building, run commands from `build/` so `enc.db` is created there:
+After building, run commands inside the same container shell so `enc.db` is
+created in `/connect`:
 
 ```sh
 rm -f enc.db
@@ -50,6 +68,4 @@ rm -f enc.db
 ./stor -u alice -k secret123 -f notes read
 ```
 
-The current starter `stor.c` is still a stub, so these commands are expected to
-print `invalid` until the implementation is filled in. The provided functionality
-scenarios are in `tests.json`.
+The provided functionality scenarios are in `tests.json`.
