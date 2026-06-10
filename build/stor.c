@@ -200,18 +200,21 @@ static void hmac_sha256(const unsigned char *key, uint32_t key_len,
     sha256_final(&s, out);
 }
 
-static void hmac2(const unsigned char *key, uint32_t key_len,
-                  const unsigned char *a, uint32_t a_len,
-                  const unsigned char *b, uint32_t b_len,
-                  unsigned char out[HASH_LEN]) {
+static int hmac2(const unsigned char *key, uint32_t key_len,
+                 const unsigned char *a, uint32_t a_len,
+                 const unsigned char *b, uint32_t b_len,
+                 unsigned char out[HASH_LEN]) {
     unsigned char *buf = NULL;
-    if (a_len > UINT32_MAX - b_len) return;
-    buf = (unsigned char *)malloc(a_len + b_len);
-    if (!buf) return;
+    uint32_t total;
+    if (a_len > UINT32_MAX - b_len) return 0;
+    total = a_len + b_len;
+    buf = (unsigned char *)malloc(total ? total : 1);
+    if (!buf) return 0;
     if (a_len) memcpy(buf, a, a_len);
     if (b_len) memcpy(buf + a_len, b, b_len);
-    hmac_sha256(key, key_len, buf, a_len + b_len, out);
+    hmac_sha256(key, key_len, buf, total, out);
     free(buf);
+    return 1;
 }
 
 static int consttime_eq(const unsigned char *a, const unsigned char *b, uint32_t len) {
@@ -221,14 +224,15 @@ static int consttime_eq(const unsigned char *a, const unsigned char *b, uint32_t
     return diff == 0;
 }
 
-static void pbkdf2_sha256(const char *password, const unsigned char *salt,
-                          uint32_t salt_len, unsigned char *out, uint32_t out_len) {
+static int pbkdf2_sha256(const char *password, const unsigned char *salt,
+                         uint32_t salt_len, unsigned char *out, uint32_t out_len) {
     uint32_t pass_len = (uint32_t)strlen(password);
     uint32_t block = 1, pos = 0;
     while (pos < out_len) {
         unsigned char *msg = (unsigned char *)malloc(salt_len + 4);
         unsigned char u[HASH_LEN], t[HASH_LEN];
         uint32_t i, n;
+        if (!msg) return 0;
         memcpy(msg, salt, salt_len);
         store_be32(msg + salt_len, block);
         hmac_sha256((const unsigned char *)password, pass_len, msg, salt_len + 4, u);
@@ -243,6 +247,7 @@ static void pbkdf2_sha256(const char *password, const unsigned char *salt,
         block++;
         free(msg);
     }
+    return 1;
 }
 
 static int random_bytes(unsigned char *buf, uint32_t len) {
@@ -296,6 +301,34 @@ static int read_field(FILE *f, unsigned char **data, uint32_t *len) {
     if (*len) {
         *data = (unsigned char *)malloc(*len);
         if (!*data || !read_exact(f, *data, *len)) return 0;
+    }
+    return 1;
+}
+
+static int validate_db(const Db *db) {
+    uint32_t i, j;
+    for (i = 0; i < db->user_count; i++) {
+        if (db->users[i].len != HASH_LEN || !db->users[i].data) return 0;
+        for (j = i + 1; j < db->user_count; j++) {
+            if (db->users[j].len == HASH_LEN &&
+                consttime_eq(db->users[i].data, db->users[j].data, HASH_LEN)) {
+                return 0;
+            }
+        }
+    }
+    for (i = 0; i < db->file_count; i++) {
+        if (db->files[i].owner_len != HASH_LEN || db->files[i].name_len != HASH_LEN ||
+            !db->files[i].owner || !db->files[i].name) {
+            return 0;
+        }
+        if (db->files[i].cipher_len > 0 && db->files[i].cipher_len < 8) return 0;
+        for (j = i + 1; j < db->file_count; j++) {
+            if (db->files[j].owner_len == HASH_LEN && db->files[j].name_len == HASH_LEN &&
+                consttime_eq(db->files[i].owner, db->files[j].owner, HASH_LEN) &&
+                consttime_eq(db->files[i].name, db->files[j].name, HASH_LEN)) {
+                return 0;
+            }
+        }
     }
     return 1;
 }
@@ -356,6 +389,11 @@ static int load_db(Db *db) {
         }
     }
     if (fgetc(f) != EOF) {
+        fclose(f);
+        db_free(db);
+        return 0;
+    }
+    if (!validate_db(db)) {
         fclose(f);
         db_free(db);
         return 0;
@@ -425,21 +463,24 @@ static int find_file(Db *db, const char *owner, const char *name) {
     return -1;
 }
 
-static void make_verifier(const unsigned char *mac_key, const char *user,
-                          unsigned char out[HASH_LEN]) {
+static int make_verifier(const unsigned char *mac_key, const char *user,
+                         unsigned char out[HASH_LEN]) {
     unsigned char prefix[] = "stor verifier v1";
-    hmac2(mac_key, KEY_LEN, prefix, (uint32_t)strlen((char *)prefix),
-          (const unsigned char *)user, (uint32_t)strlen(user), out);
+    return hmac2(mac_key, KEY_LEN, prefix, (uint32_t)strlen((char *)prefix),
+                 (const unsigned char *)user, (uint32_t)strlen(user), out);
 }
 
 static int derive_and_verify(User *u, const char *user, const char *key,
                              unsigned char enc_key[KEY_LEN],
                              unsigned char mac_key[KEY_LEN]) {
     unsigned char km[KEY_MATERIAL_LEN], verifier[HASH_LEN];
-    pbkdf2_sha256(key, u->salt, SALT_LEN, km, KEY_MATERIAL_LEN);
+    if (!pbkdf2_sha256(key, u->salt, SALT_LEN, km, KEY_MATERIAL_LEN)) return 0;
     memcpy(enc_key, km, KEY_LEN);
     memcpy(mac_key, km + KEY_LEN, KEY_LEN);
-    make_verifier(mac_key, user, verifier);
+    if (!make_verifier(mac_key, user, verifier)) {
+        memset(km, 0, sizeof(km));
+        return 0;
+    }
     memset(km, 0, sizeof(km));
     return consttime_eq(verifier, u->verifier, HASH_LEN);
 }
@@ -449,6 +490,7 @@ static int add_user(Db *db, const char *name, const char *key) {
     User *u;
     unsigned char km[KEY_MATERIAL_LEN], id[HASH_LEN];
     if (strlen(name) > MAX_FIELD_LEN) return 0;
+    if (idx >= 0) return 0;
     if (idx < 0) {
         User *new_users = (User *)realloc(db->users, (db->user_count + 1) * sizeof(User));
         if (!new_users) return 0;
@@ -460,12 +502,13 @@ static int add_user(Db *db, const char *name, const char *key) {
         u->data = (unsigned char *)malloc(u->len);
         if (u->len && !u->data) return 0;
         memcpy(u->data, id, u->len);
-    } else {
-        u = &db->users[idx];
     }
     if (!random_bytes(u->salt, SALT_LEN)) return 0;
-    pbkdf2_sha256(key, u->salt, SALT_LEN, km, KEY_MATERIAL_LEN);
-    make_verifier(km + KEY_LEN, name, u->verifier);
+    if (!pbkdf2_sha256(key, u->salt, SALT_LEN, km, KEY_MATERIAL_LEN)) return 0;
+    if (!make_verifier(km + KEY_LEN, name, u->verifier)) {
+        memset(km, 0, sizeof(km));
+        return 0;
+    }
     memset(km, 0, sizeof(km));
     return 1;
 }
@@ -504,9 +547,9 @@ static unsigned char *make_aad(FileEntry *fe, uint32_t *aad_len) {
     return aad;
 }
 
-static void crypt_stream(const unsigned char enc_key[KEY_LEN], const unsigned char nonce[NONCE_LEN],
-                         const unsigned char *aad, uint32_t aad_len,
-                         const unsigned char *in, unsigned char *out, uint32_t len) {
+static int crypt_stream(const unsigned char enc_key[KEY_LEN], const unsigned char nonce[NONCE_LEN],
+                        const unsigned char *aad, uint32_t aad_len,
+                        const unsigned char *in, unsigned char *out, uint32_t len) {
     unsigned char seed[HASH_LEN], block[HASH_LEN], ctrbuf[HASH_LEN + 4];
     uint32_t pos = 0, ctr = 0;
     hmac_sha256(enc_key, KEY_LEN, aad, aad_len, seed);
@@ -514,26 +557,32 @@ static void crypt_stream(const unsigned char enc_key[KEY_LEN], const unsigned ch
         uint32_t take, i;
         memcpy(ctrbuf, seed, HASH_LEN);
         store_be32(ctrbuf + HASH_LEN, ctr++);
-        hmac2(enc_key, KEY_LEN, nonce, NONCE_LEN, ctrbuf, HASH_LEN + 4, block);
+        if (!hmac2(enc_key, KEY_LEN, nonce, NONCE_LEN, ctrbuf, HASH_LEN + 4, block)) return 0;
         take = len - pos < HASH_LEN ? len - pos : HASH_LEN;
         for (i = 0; i < take; i++) out[pos + i] = in[pos + i] ^ block[i];
         pos += take;
     }
+    return 1;
 }
 
-static void make_tag(const unsigned char mac_key[KEY_LEN], const unsigned char *aad, uint32_t aad_len,
-                     const unsigned char nonce[NONCE_LEN], const unsigned char *cipher,
-                     uint32_t cipher_len, unsigned char out[HASH_LEN]) {
+static int make_tag(const unsigned char mac_key[KEY_LEN], const unsigned char *aad, uint32_t aad_len,
+                    const unsigned char nonce[NONCE_LEN], const unsigned char *cipher,
+                    uint32_t cipher_len, unsigned char out[HASH_LEN]) {
     unsigned char *buf;
-    uint32_t total = aad_len + NONCE_LEN + 4 + cipher_len;
-    buf = (unsigned char *)malloc(total);
-    if (!buf) return;
+    uint32_t prefix_len, total;
+    if (aad_len > UINT32_MAX - NONCE_LEN - 4) return 0;
+    prefix_len = aad_len + NONCE_LEN + 4;
+    if (cipher_len > UINT32_MAX - prefix_len) return 0;
+    total = prefix_len + cipher_len;
+    buf = (unsigned char *)malloc(total ? total : 1);
+    if (!buf) return 0;
     memcpy(buf, aad, aad_len);
     memcpy(buf + aad_len, nonce, NONCE_LEN);
     store_be32(buf + aad_len + NONCE_LEN, cipher_len);
     memcpy(buf + aad_len + NONCE_LEN + 4, cipher, cipher_len);
     hmac_sha256(mac_key, KEY_LEN, buf, total, out);
     free(buf);
+    return 1;
 }
 
 static int encrypt_file(FileEntry *fe, const unsigned char enc_key[KEY_LEN],
@@ -571,8 +620,12 @@ static int encrypt_file(FileEntry *fe, const unsigned char enc_key[KEY_LEN],
         free(payload);
         return 0;
     }
-    crypt_stream(enc_key, fe->nonce, aad, aad_len, payload, fe->cipher, fe->cipher_len);
-    make_tag(mac_key, aad, aad_len, fe->nonce, fe->cipher, fe->cipher_len, fe->tag);
+    if (!crypt_stream(enc_key, fe->nonce, aad, aad_len, payload, fe->cipher, fe->cipher_len) ||
+        !make_tag(mac_key, aad, aad_len, fe->nonce, fe->cipher, fe->cipher_len, fe->tag)) {
+        free(aad);
+        free(payload);
+        return 0;
+    }
     free(aad);
     free(payload);
     return 1;
@@ -585,11 +638,14 @@ static int decrypt_file(FileEntry *fe, const unsigned char enc_key[KEY_LEN],
     uint32_t aad_len;
     *plain = NULL;
     *plain_len = 0;
-    if (fe->cipher_len == 0) return 1;
+    if (fe->cipher_len == 0) return 0;
     if (fe->cipher_len < 8 || fe->cipher_len > MAX_CONTENT_LEN + 4096U) return 0;
     aad = make_aad(fe, &aad_len);
     if (!aad) return 0;
-    make_tag(mac_key, aad, aad_len, fe->nonce, fe->cipher, fe->cipher_len, tag);
+    if (!make_tag(mac_key, aad, aad_len, fe->nonce, fe->cipher, fe->cipher_len, tag)) {
+        free(aad);
+        return 0;
+    }
     if (!consttime_eq(tag, fe->tag, HASH_LEN)) {
         free(aad);
         return 0;
@@ -599,7 +655,11 @@ static int decrypt_file(FileEntry *fe, const unsigned char enc_key[KEY_LEN],
         free(aad);
         return 0;
     }
-    crypt_stream(enc_key, fe->nonce, aad, aad_len, fe->cipher, payload, fe->cipher_len);
+    if (!crypt_stream(enc_key, fe->nonce, aad, aad_len, fe->cipher, payload, fe->cipher_len)) {
+        free(aad);
+        free(payload);
+        return 0;
+    }
     *plain_len = (uint32_t)load_be64(payload);
     if (*plain_len > fe->cipher_len - 8 || *plain_len > MAX_CONTENT_LEN) {
         free(aad);
