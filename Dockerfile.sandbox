@@ -37,7 +37,7 @@ RUN apt-get update
 RUN apt-get install -y libssl-dev:i386 libsodium-dev:i386
 
 # execstack (contest requires executable stack)
-RUN add-apt-repository universe && apt-get update && apt-get install -y execstack
+RUN apt-get update && apt-get install -y execstack
 
 # Avoid entropy blocking in containers
 RUN rm /dev/random && ln -s /dev/urandom /dev/random
